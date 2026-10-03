@@ -1,0 +1,116 @@
+name: mirror
+
+on:
+  schedule:
+    - cron: "0 4 2 * *"   # 2nd of the month, 04:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write         # releases and tags
+
+concurrency:
+  group: mirror
+  cancel-in-progress: false
+
+env:
+  KEEP_RELEASES: 3
+  MIN_DOWNLOAD_BYTES: 52428800   # 50 MB
+  MAX_ROW_DROP_PERCENT: 50
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests
+
+      - name: Download world export
+        env:
+          OPENCELLID_TOKEN: ${{ secrets.OPENCELLID_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OPENCELLID_TOKEN:-}" ]; then
+            echo "::error::secret OPENCELLID_TOKEN is not set"
+            exit 1
+          fi
+          echo "::add-mask::${OPENCELLID_TOKEN}"
+          # The URL (with the token) goes to curl on stdin, so it is neither
+          # in the process list nor in any log. No `set -x` anywhere.
+          printf 'url = "https://opencellid.org/ocid/downloads?token=%s&type=full&file=cell_towers.csv.gz"\n' \
+            "${OPENCELLID_TOKEN}" |
+            curl -sS --fail --retry 3 --retry-delay 60 --connect-timeout 30 \
+              -K - -o cell_towers.csv.gz
+          size=$(stat -c %s cell_towers.csv.gz)
+          echo "downloaded ${size} bytes"
+          if [ "${size}" -lt "${MIN_DOWNLOAD_BYTES}" ]; then
+            echo "::error::download is suspiciously small (${size} < ${MIN_DOWNLOAD_BYTES} bytes)"
+            exit 1
+          fi
+          gzip -t cell_towers.csv.gz
+
+      - name: Split by MCC
+        run: |
+          set -euo pipefail
+          python3 split.py cell_towers.csv.gz out
+          count=$(ls out | wc -l)
+          echo "${count} assets"
+          if [ "${count}" -gt 900 ]; then
+            echo "::error::too many assets for one release (${count})"
+            exit 1
+          fi
+          if find out -type f -size +1900M | grep -q .; then
+            echo "::error::an asset exceeds the 2 GB release asset limit"
+            exit 1
+          fi
+
+      - name: Compare with the previous release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir prev
+          if gh release download --pattern manifest.json --dir prev 2>/dev/null; then
+            python3 - <<'PY'
+          import json, sys, os
+          prev = sum(f["rows"] for f in json.load(open("prev/manifest.json"))["files"])
+          cur = sum(f["rows"] for f in json.load(open("out/manifest.json"))["files"])
+          limit = float(os.environ["MAX_ROW_DROP_PERCENT"])
+          print(f"rows: previous {prev}, now {cur}")
+          if prev and cur < prev * (1 - limit / 100):
+              sys.exit(f"::error::rows dropped by more than {limit:.0f}% ({prev} -> {cur})")
+          PY
+          else
+            echo "no previous release; skipping the row comparison"
+          fi
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag=$(date -u +%Y-%m)
+          credit=$(python3 -c 'import json; print(json.load(open("out/manifest.json"))["credit"])')
+          # A re-run in the same month replaces that month's release.
+          if gh release view "${tag}" >/dev/null 2>&1; then
+            gh release delete "${tag}" --cleanup-tag --yes
+          fi
+          gh release create "${tag}" out/* \
+            --title "OpenCelliD mirror ${tag}" \
+            --notes "${credit}. Per-MCC exports of the OpenCelliD database; see README.md." \
+            --target "${GITHUB_SHA}" \
+            --latest
+
+      - name: Prune old releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release list --limit 100 --json tagName,createdAt \
+            --jq 'sort_by(.createdAt) | reverse | .['"${KEEP_RELEASES}"':] | .[].tagName' |
+            while read -r old; do
+              echo "deleting ${old}"
+              gh release delete "${old}" --cleanup-tag --yes
+            done

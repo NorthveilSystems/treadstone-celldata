@@ -1,0 +1,3 @@
+out/
+*.csv.gz
+__pycache__/
